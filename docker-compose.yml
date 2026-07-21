@@ -28,6 +28,9 @@ x-airflow-common:
     S3_BUCKET: ${S3_BUCKET:-de-school-educational-data}
     S3_BASE_PREFIX: ${S3_BASE_PREFIX:-final_task/karbaia_nano}
 
+    CHEMBL_CACHE_DIR: /opt/airflow/chembl_cache
+    PYSTOW_HOME: /opt/airflow/chembl_cache
+
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
   volumes:
@@ -36,6 +39,7 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
     - ${AIRFLOW_PROJ_DIR:-.}/tests:/opt/airflow/tests
+    - ${AIRFLOW_PROJ_DIR:-.}/chembl_cache:/opt/airflow/chembl_cache
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on

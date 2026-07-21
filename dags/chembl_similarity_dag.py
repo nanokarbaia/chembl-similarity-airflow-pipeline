@@ -6,6 +6,7 @@ from datetime import timedelta
 
 import pendulum
 from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.providers.standard.operators.python import PythonOperator
 from airflow.sdk import DAG, Param
 from airflow.utils.trigger_rule import TriggerRule
 
@@ -14,6 +15,7 @@ from lib.chembl.constants import (
     DEFAULT_SOURCE_MOLECULE_LIMIT,
     DEFAULT_TOP_N,
 )
+from lib.chembl.ingestion import ingest_chembl_bronze
 from lib.utils.teams import send_teams_alert
 
 
@@ -25,16 +27,21 @@ with DAG(
     catchup=False,
     tags=['chembl', 'similarity', 'rdkit', 'de_school'],
     params={
+        'chembl_version': Param(
+            default=None,
+            type=['null', 'string'],
+            description='Optional ChEMBL version. Use null for latest available version.',
+        ),
         'chembl_page_limit': Param(
             default=DEFAULT_CHEMBL_PAGE_LIMIT,
             type='integer',
             minimum=1,
-            description='Number of records to request per ChEMBL API page.',
+            description='Kept for compatibility. Not used by SQLite dump ingestion.',
         ),
         'ingest_record_limit': Param(
-            default=None,
+            default=1000,
             type=['null', 'integer'],
-            description='Optional development limit for ingested molecule records. Use null for full ingestion.',
+            description='Optional development limit per ChEMBL table. Use null for full ingestion.',
         ),
         'source_molecule_limit': Param(
             default=DEFAULT_SOURCE_MOLECULE_LIMIT,
@@ -52,7 +59,7 @@ with DAG(
     dagrun_timeout=timedelta(hours=6),
     default_args={
         'owner': 'data-platform',
-        'retries': 1,
+        'retries': 0,
         'retry_delay': timedelta(minutes=2),
         'retry_exponential_backoff': True,
         'max_retry_delay': timedelta(minutes=30),
@@ -61,7 +68,11 @@ with DAG(
 ) as dag:
     start_op = EmptyOperator(task_id='start')
 
-    ingest_chembl_data_op = EmptyOperator(task_id='ingest_chembl_data')
+    ingest_chembl_data_op = PythonOperator(
+        task_id='ingest_chembl_bronze',
+        python_callable=ingest_chembl_bronze,
+    )
+
     prepare_silver_layer_op = EmptyOperator(task_id='prepare_silver_layer')
     compute_fingerprints_op = EmptyOperator(task_id='compute_fingerprints')
     compute_similarity_scores_op = EmptyOperator(task_id='compute_similarity_scores')

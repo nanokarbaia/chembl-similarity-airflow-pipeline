@@ -29,3 +29,6 @@ plugins/*
 # OS files
 .DS_Store
 Thumbs.db
+
+# Large downloaded ChEMBL files
+chembl_cache/
