@@ -16,6 +16,8 @@ from lib.chembl.constants import (
     DEFAULT_TOP_N,
 )
 from lib.chembl.ingestion import ingest_chembl_bronze
+from lib.chembl.silver import prepare_silver_molecules
+
 from lib.utils.teams import send_teams_alert
 
 
@@ -73,7 +75,11 @@ with DAG(
         python_callable=ingest_chembl_bronze,
     )
 
-    prepare_silver_layer_op = EmptyOperator(task_id='prepare_silver_layer')
+    prepare_silver_layer_op = PythonOperator(
+        task_id='prepare_silver_layer',
+        python_callable=prepare_silver_molecules,
+    )
+
     compute_fingerprints_op = EmptyOperator(task_id='compute_fingerprints')
     compute_similarity_scores_op = EmptyOperator(task_id='compute_similarity_scores')
     extract_top10_similarities_op = EmptyOperator(task_id='extract_top10_similarities')
