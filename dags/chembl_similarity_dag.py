@@ -12,11 +12,13 @@ from airflow.utils.trigger_rule import TriggerRule
 
 from lib.chembl.constants import (
     DEFAULT_CHEMBL_PAGE_LIMIT,
+    DEFAULT_FINGERPRINT_BATCH_SIZE,
     DEFAULT_SOURCE_MOLECULE_LIMIT,
     DEFAULT_TOP_N,
 )
 from lib.chembl.ingestion import ingest_chembl_bronze
 from lib.chembl.silver import prepare_silver_molecules
+from lib.chembl.fingerprints import compute_and_upload_fingerprints
 
 from lib.utils.teams import send_teams_alert
 
@@ -57,6 +59,12 @@ with DAG(
             minimum=1,
             description='Number of most similar molecules to keep per source molecule.',
         ),
+        'fingerprint_batch_size': Param(
+            default=DEFAULT_FINGERPRINT_BATCH_SIZE,
+            type='integer',
+            minimum=1,
+            description='Number of silver molecules processed per fingerprint parquet file.',
+        ),
     },
     dagrun_timeout=timedelta(hours=6),
     default_args={
@@ -80,7 +88,14 @@ with DAG(
         python_callable=prepare_silver_molecules,
     )
 
-    compute_fingerprints_op = EmptyOperator(task_id='compute_fingerprints')
+    compute_fingerprints_op = PythonOperator(
+        task_id='compute_fingerprints',
+        python_callable=compute_and_upload_fingerprints,
+        op_kwargs={
+            'batch_size': '{{ params.fingerprint_batch_size }}',
+        },
+    )
+
     compute_similarity_scores_op = EmptyOperator(task_id='compute_similarity_scores')
     extract_top10_similarities_op = EmptyOperator(task_id='extract_top10_similarities')
     build_data_mart_op = EmptyOperator(task_id='build_data_mart')
