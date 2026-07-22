@@ -15,10 +15,12 @@ from lib.chembl.constants import (
     DEFAULT_FINGERPRINT_BATCH_SIZE,
     DEFAULT_SOURCE_MOLECULE_LIMIT,
     DEFAULT_TOP_N,
+    SOURCE_INPUT_PREFIX,
 )
 from lib.chembl.ingestion import ingest_chembl_bronze
-from lib.chembl.silver import prepare_silver_molecules
 from lib.chembl.fingerprints import compute_and_upload_fingerprints
+from lib.chembl.silver import prepare_silver_molecules
+from lib.chembl.similarity import compute_similarity_scores_and_top10
 
 from lib.utils.teams import send_teams_alert
 
@@ -65,6 +67,11 @@ with DAG(
             minimum=1,
             description='Number of silver molecules processed per fingerprint parquet file.',
         ),
+        'source_input_prefix': Param(
+            default=SOURCE_INPUT_PREFIX,
+            type='string',
+            description='S3 prefix with input source molecule CSV files.',
+        ),
     },
     dagrun_timeout=timedelta(hours=6),
     default_args={
@@ -96,8 +103,16 @@ with DAG(
         },
     )
 
-    compute_similarity_scores_op = EmptyOperator(task_id='compute_similarity_scores')
-    extract_top10_similarities_op = EmptyOperator(task_id='extract_top10_similarities')
+    compute_similarity_scores_op = PythonOperator(
+        task_id='compute_similarity_scores_and_top10',
+        python_callable=compute_similarity_scores_and_top10,
+        op_kwargs={
+            'source_input_prefix': '{{ params.source_input_prefix }}',
+            'source_molecule_limit': '{{ params.source_molecule_limit }}',
+            'top_n': '{{ params.top_n }}',
+        },
+    )
+
     build_data_mart_op = EmptyOperator(task_id='build_data_mart')
     create_views_op = EmptyOperator(task_id='create_views')
 
@@ -107,13 +122,12 @@ with DAG(
     )
 
     (
-        start_op
-        >> ingest_chembl_data_op
-        >> prepare_silver_layer_op
-        >> compute_fingerprints_op
-        >> compute_similarity_scores_op
-        >> extract_top10_similarities_op
-        >> build_data_mart_op
-        >> create_views_op
-        >> finish_op
+            start_op
+            >> ingest_chembl_data_op
+            >> prepare_silver_layer_op
+            >> compute_fingerprints_op
+            >> compute_similarity_scores_op
+            >> build_data_mart_op
+            >> create_views_op
+            >> finish_op
     )

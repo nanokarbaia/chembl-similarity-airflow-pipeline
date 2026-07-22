@@ -10,6 +10,11 @@ MSTEAMS_CONN_ID = 'msteams_webhook'
 
 S3_BUCKET = os.getenv('S3_BUCKET', 'de-school-educational-data')
 S3_BASE_PREFIX = os.getenv('S3_BASE_PREFIX', 'final_task/karbaia_nano').strip('/')
+SOURCE_INPUT_PREFIX = os.getenv('SOURCE_INPUT_PREFIX', 'input/karbaia_nano').strip('/')
+
+FINGERPRINTS_S3_PREFIX = f'{S3_BASE_PREFIX}/fingerprints'
+SIMILARITY_S3_PREFIX = f'{S3_BASE_PREFIX}/similarity_scores'
+TOP10_S3_PREFIX = f'{S3_BASE_PREFIX}/top10'
 
 BRONZE_SCHEMA = 'bronze'
 SILVER_SCHEMA = 'silver'
@@ -29,5 +34,3 @@ DEFAULT_SOURCE_MOLECULE_LIMIT = 100
 DEFAULT_TOP_N = 10
 DEFAULT_LOAD_BATCH_SIZE = 10_000
 DEFAULT_FINGERPRINT_BATCH_SIZE = 5_000
-
-FINGERPRINTS_S3_PREFIX = f'{S3_BASE_PREFIX}/fingerprints'
