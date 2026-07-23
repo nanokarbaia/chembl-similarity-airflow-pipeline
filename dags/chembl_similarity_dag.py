@@ -17,8 +17,9 @@ from lib.chembl.constants import (
     DEFAULT_TOP_N,
     SOURCE_INPUT_PREFIX,
 )
-from lib.chembl.ingestion import ingest_chembl_bronze
 from lib.chembl.fingerprints import compute_and_upload_fingerprints
+from lib.chembl.gold import build_gold_data_mart, create_gold_views
+from lib.chembl.ingestion import ingest_chembl_bronze
 from lib.chembl.silver import prepare_silver_molecules
 from lib.chembl.similarity import compute_similarity_scores_and_top10
 
@@ -113,8 +114,15 @@ with DAG(
         },
     )
 
-    build_data_mart_op = EmptyOperator(task_id='build_data_mart')
-    create_views_op = EmptyOperator(task_id='create_views')
+    build_data_mart_op = PythonOperator(
+        task_id='build_data_mart',
+        python_callable=build_gold_data_mart,
+    )
+
+    create_views_op = PythonOperator(
+        task_id='create_views',
+        python_callable=create_gold_views,
+    )
 
     finish_op = EmptyOperator(
         task_id='finish',
