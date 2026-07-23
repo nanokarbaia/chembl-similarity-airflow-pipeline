@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -20,6 +21,93 @@ from lib.chembl.constants import (
 
 logger = logging.getLogger(__name__)
 
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+DEFAULT_MAX_RETRIES = 5
+DEFAULT_REQUEST_TIMEOUT = 120
+
+
+def fetch_chembl_page(
+    session: requests.Session,
+    resource: str,
+    limit: int,
+    offset: int,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
+) -> dict[str, Any]:
+    """Fetch one page from the ChEMBL API with retry and backoff."""
+    url = f'{CHEMBL_API_BASE_URL}/{resource}.json'
+    params = {
+        'limit': limit,
+        'offset': offset,
+    }
+
+    last_exception: Exception | None = None
+    last_response: requests.Response | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = session.get(
+                url,
+                params=params,
+                timeout=request_timeout,
+            )
+            last_response = response
+
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+        ) as exception:
+            last_exception = exception
+            wait_seconds = min(2 ** attempt, 60)
+
+            logger.warning(
+                'ChEMBL API request failed. '
+                'resource=%s, limit=%s, offset=%s, attempt=%s/%s. '
+                'Retrying in %s seconds. Error: %s',
+                resource,
+                limit,
+                offset,
+                attempt,
+                max_retries,
+                wait_seconds,
+                exception,
+            )
+
+            time.sleep(wait_seconds)
+            continue
+
+        if response.status_code not in RETRYABLE_STATUS_CODES:
+            response.raise_for_status()
+            return response.json()
+
+        wait_seconds = min(2 ** attempt, 60)
+
+        logger.warning(
+            'ChEMBL API returned retryable status %s. '
+            'resource=%s, limit=%s, offset=%s, attempt=%s/%s. '
+            'Retrying in %s seconds.',
+            response.status_code,
+            resource,
+            limit,
+            offset,
+            attempt,
+            max_retries,
+            wait_seconds,
+        )
+
+        time.sleep(wait_seconds)
+
+    if last_response is not None:
+        last_response.raise_for_status()
+
+    if last_exception is not None:
+        raise last_exception
+
+    raise RuntimeError(
+        f'Failed to fetch ChEMBL records for resource={resource}, '
+        f'limit={limit}, offset={offset}'
+    )
+
 
 def fetch_chembl_records(
     resource: str,
@@ -28,40 +116,56 @@ def fetch_chembl_records(
     page_limit: int = DEFAULT_CHEMBL_PAGE_LIMIT,
 ) -> Iterable[dict[str, Any]]:
     """Fetch records from the ChEMBL API using pagination."""
-    session = requests.Session()
+    if record_limit < 1:
+        raise ValueError('record_limit must be at least 1.')
+
+    if page_limit < 1:
+        raise ValueError('page_limit must be at least 1.')
+
     total_records = 0
     offset = 0
 
-    while total_records < record_limit:
-        current_limit = min(page_limit, record_limit - total_records)
+    with requests.Session() as session:
+        while total_records < record_limit:
+            current_limit = min(page_limit, record_limit - total_records)
 
-        response = session.get(
-            f'{CHEMBL_API_BASE_URL}/{resource}.json',
-            params={
-                'limit': current_limit,
-                'offset': offset,
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
+            payload = fetch_chembl_page(
+                session=session,
+                resource=resource,
+                limit=current_limit,
+                offset=offset,
+            )
 
-        payload = response.json()
-        records = payload.get(records_key, [])
+            records = payload.get(records_key, [])
 
-        if not records:
-            break
-
-        for record in records:
-            yield record
-            total_records += 1
-
-            if total_records >= record_limit:
+            if not records:
+                logger.warning(
+                    'No records returned from ChEMBL API. '
+                    'resource=%s, records_key=%s, offset=%s, limit=%s',
+                    resource,
+                    records_key,
+                    offset,
+                    current_limit,
+                )
                 break
 
-        if not payload.get('page_meta', {}).get('next'):
-            break
+            for record in records:
+                yield record
+                total_records += 1
 
-        offset += len(records)
+                if total_records >= record_limit:
+                    break
+
+            if not payload.get('page_meta', {}).get('next'):
+                break
+
+            offset += len(records)
+
+    logger.info(
+        'Fetched %s record(s) from ChEMBL resource=%s.',
+        total_records,
+        resource,
+    )
 
 
 def insert_rows(
