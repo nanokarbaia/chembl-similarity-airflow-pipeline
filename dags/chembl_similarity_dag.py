@@ -22,6 +22,13 @@ from lib.chembl.gold import build_gold_data_mart, create_gold_views
 from lib.chembl.ingestion import ingest_chembl_bronze
 from lib.chembl.silver import prepare_silver_molecules
 from lib.chembl.similarity import compute_similarity_scores_and_top10
+from lib.chembl.quality import (
+    bronze_quality_checks,
+    fingerprint_quality_checks,
+    gold_quality_checks,
+    silver_quality_checks,
+    top10_quality_checks,
+)
 
 from lib.utils.teams import send_teams_alert
 
@@ -129,13 +136,49 @@ with DAG(
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
+    bronze_quality_checks_op = PythonOperator(
+        task_id='bronze_quality_checks',
+        python_callable=bronze_quality_checks,
+    )
+
+    silver_quality_checks_op = PythonOperator(
+        task_id='silver_quality_checks',
+        python_callable=silver_quality_checks,
+    )
+
+    fingerprint_quality_checks_op = PythonOperator(
+        task_id='fingerprint_quality_checks',
+        python_callable=fingerprint_quality_checks,
+    )
+
+    top10_quality_checks_op = PythonOperator(
+        task_id='top10_quality_checks',
+        python_callable=top10_quality_checks,
+        op_kwargs={
+            'top_n': '{{ params.top_n }}',
+        },
+    )
+
+    gold_quality_checks_op = PythonOperator(
+        task_id='gold_quality_checks',
+        python_callable=gold_quality_checks,
+        op_kwargs={
+            'top_n': '{{ params.top_n }}',
+        },
+    )
+
     (
             start_op
             >> ingest_chembl_data_op
+            >> bronze_quality_checks_op
             >> prepare_silver_layer_op
+            >> silver_quality_checks_op
             >> compute_fingerprints_op
+            >> fingerprint_quality_checks_op
             >> compute_similarity_scores_op
+            >> top10_quality_checks_op
             >> build_data_mart_op
             >> create_views_op
+            >> gold_quality_checks_op
             >> finish_op
     )
