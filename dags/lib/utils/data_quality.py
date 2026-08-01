@@ -53,14 +53,15 @@ def get_relation_row_count(
     relation_name: str,
 ) -> int:
     """Return row count for a table or view."""
-    cursor.execute(
-        sql.SQL('SELECT COUNT(*) FROM {}.{}').format(
+    row_count = fetch_single_value(
+        cursor=cursor,
+        query=sql.SQL('SELECT COUNT(*) FROM {}.{}').format(
             sql.Identifier(schema_name),
             sql.Identifier(relation_name),
-        )
+        ),
     )
 
-    return cursor.fetchone()[0]
+    return int(row_count)
 
 
 def check_required_columns(
@@ -70,23 +71,26 @@ def check_required_columns(
     required_columns: list[str],
 ) -> None:
     """Check that a table contains all required columns."""
-    missing_columns = fetch_single_value(
-        cursor=cursor,
-        query="""
-            SELECT COUNT(*)
-            FROM UNNEST(%s::TEXT[]) AS required_columns(column_name)
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM information_schema.columns existing_columns
-                WHERE existing_columns.table_schema = %s
-                  AND existing_columns.table_name = %s
-                  AND existing_columns.column_name = required_columns.column_name
-            )
+    cursor.execute(
+        """
+        SELECT required_columns.column_name
+        FROM UNNEST(%s::TEXT[]) AS required_columns(column_name)
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM information_schema.columns existing_columns
+            WHERE existing_columns.table_schema = %s
+              AND existing_columns.table_name = %s
+              AND existing_columns.column_name = required_columns.column_name
+        )
+        ORDER BY required_columns.column_name
         """,
-        parameters=(required_columns, schema_name, table_name),
+        (required_columns, schema_name, table_name),
     )
 
-    assert_zero(
-        value=missing_columns,
-        check_name=f'{schema_name}.{table_name} required columns',
-    )
+    missing_columns = [row[0] for row in cursor.fetchall()]
+
+    if missing_columns:
+        raise ValueError(
+            f'{schema_name}.{table_name} is missing required columns: '
+            f'{missing_columns}'
+        )

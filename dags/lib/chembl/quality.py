@@ -12,12 +12,15 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 from lib.chembl.constants import (
     AWS_CONN_ID,
+    CHEMBL_ID_PATTERN,
     DWH_CONN_ID,
     FINGERPRINT_N_BITS,
     FINGERPRINT_RADIUS,
     FINGERPRINTS_S3_PREFIX,
     S3_BUCKET,
-    TOP10_S3_PREFIX,
+    SIMILARITY_S3_PREFIX,
+    TOP10_FILE_NAME,
+    TOP10_S3_KEY,
 )
 from lib.utils.data_quality import (
     assert_equal,
@@ -27,15 +30,15 @@ from lib.utils.data_quality import (
     fetch_single_value,
     get_relation_row_count,
 )
+from lib.utils.parsing import parse_positive_int
 from lib.utils.s3 import (
+    build_s3_folder_prefix,
     download_s3_file,
     get_s3_client,
     list_s3_keys,
 )
 
 logger = logging.getLogger(__name__)
-
-CHEMBL_ID_PATTERN = r'^CHEMBL[0-9]+$'
 
 BRONZE_TABLES = [
     'chembl_id_lookup',
@@ -73,19 +76,26 @@ REQUIRED_GOLD_VIEWS = [
     'vw_avg_similarity_grouping_sets',
 ]
 
-TOP10_S3_KEY = f'{TOP10_S3_PREFIX}/top10_similar_molecules.parquet'
-
-
 CHEMBL_ID_CHECK = pa.Check(
-    lambda series: series.astype(str).str.match(CHEMBL_ID_PATTERN),
+    lambda series: series.astype(str).str.fullmatch(CHEMBL_ID_PATTERN),
     error='Column must contain valid ChEMBL IDs.',
 )
 
 FINGERPRINT_SCHEMA = pa.DataFrameSchema(
     {
-        'chembl_id': pa.Column(str, nullable=False, checks=CHEMBL_ID_CHECK),
-        'canonical_smiles': pa.Column(str, nullable=False),
-        'fingerprint_binary': pa.Column(object, nullable=False),
+        'chembl_id': pa.Column(
+            str,
+            nullable=False,
+            checks=CHEMBL_ID_CHECK,
+        ),
+        'canonical_smiles': pa.Column(
+            str,
+            nullable=False,
+        ),
+        'fingerprint_binary': pa.Column(
+            object,
+            nullable=False,
+        ),
         'fingerprint_on_bits': pa.Column(
             int,
             nullable=False,
@@ -103,6 +113,31 @@ FINGERPRINT_SCHEMA = pa.DataFrameSchema(
             int,
             nullable=False,
             checks=pa.Check.equal_to(FINGERPRINT_N_BITS),
+        ),
+    },
+    strict=False,
+    coerce=True,
+)
+
+SIMILARITY_SCHEMA = pa.DataFrameSchema(
+    {
+        'source_chembl_id': pa.Column(
+            str,
+            nullable=False,
+            checks=CHEMBL_ID_CHECK,
+        ),
+        'target_chembl_id': pa.Column(
+            str,
+            nullable=False,
+            checks=CHEMBL_ID_CHECK,
+        ),
+        'similarity_score': pa.Column(
+            float,
+            nullable=False,
+            checks=[
+                pa.Check.ge(0),
+                pa.Check.le(1),
+            ],
         ),
     },
     strict=False,
@@ -169,7 +204,7 @@ def bronze_quality_checks() -> dict[str, int]:
     """Run quality checks for the bronze layer."""
     postgres_hook = PostgresHook(postgres_conn_id=DWH_CONN_ID)
     connection = postgres_hook.get_conn()
-    results = {}
+    results: dict[str, int] = {}
 
     try:
         with connection.cursor() as cursor:
@@ -199,6 +234,7 @@ def silver_quality_checks() -> dict[str, int]:
     """Run quality checks for the silver molecule table."""
     postgres_hook = PostgresHook(postgres_conn_id=DWH_CONN_ID)
     connection = postgres_hook.get_conn()
+    silver_rows = 0
 
     try:
         with connection.cursor() as cursor:
@@ -281,17 +317,19 @@ def silver_quality_checks() -> dict[str, int]:
 def fingerprint_quality_checks() -> dict[str, int]:
     """Run Pandera checks for fingerprint parquet files in S3."""
     s3_client = get_s3_client(aws_conn_id=AWS_CONN_ID)
+    fingerprint_folder_prefix = build_s3_folder_prefix(FINGERPRINTS_S3_PREFIX)
 
     fingerprint_keys = list_s3_keys(
         s3_client=s3_client,
         bucket_name=S3_BUCKET,
-        prefix=FINGERPRINTS_S3_PREFIX,
+        prefix=fingerprint_folder_prefix,
         suffix='.parquet',
     )
 
     if not fingerprint_keys:
         raise ValueError(
-            f'No fingerprint parquet files found under {FINGERPRINTS_S3_PREFIX}.'
+            f'No fingerprint parquet files found under '
+            f'{fingerprint_folder_prefix}.'
         )
 
     total_rows = 0
@@ -333,18 +371,121 @@ def fingerprint_quality_checks() -> dict[str, int]:
     return results
 
 
+def similarity_quality_checks() -> dict[str, int]:
+    """Run quality checks for full source-to-all similarity parquet files."""
+    s3_client = get_s3_client(aws_conn_id=AWS_CONN_ID)
+    similarity_folder_prefix = build_s3_folder_prefix(SIMILARITY_S3_PREFIX)
+
+    similarity_keys = list_s3_keys(
+        s3_client=s3_client,
+        bucket_name=S3_BUCKET,
+        prefix=similarity_folder_prefix,
+        suffix='.parquet',
+    )
+
+    if not similarity_keys:
+        raise ValueError(
+            f'No full similarity parquet files found under '
+            f'{similarity_folder_prefix}.'
+        )
+
+    total_rows = 0
+    source_ids: set[str] = set()
+    row_counts: list[int] = []
+
+    with TemporaryDirectory(prefix='chembl_similarity_quality_') as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+
+        for index, key in enumerate(similarity_keys):
+            local_path = temp_dir / f'similarity_{index:05d}.parquet'
+
+            download_s3_file(
+                s3_client=s3_client,
+                bucket_name=S3_BUCKET,
+                key=key,
+                local_path=local_path,
+            )
+
+            dataframe = pd.read_parquet(local_path)
+            validated_dataframe = validate_pandera_schema(
+                dataframe=dataframe,
+                schema=SIMILARITY_SCHEMA,
+                check_name=f'Full similarity quality check for {key}',
+            )
+
+            duplicate_pairs = validated_dataframe.duplicated(
+                subset=['source_chembl_id', 'target_chembl_id'],
+            )
+
+            if duplicate_pairs.any():
+                raise ValueError(
+                    f'Full similarity file contains duplicate pairs: {key}'
+                )
+
+            self_matches = validated_dataframe[
+                validated_dataframe['source_chembl_id']
+                == validated_dataframe['target_chembl_id']
+            ]
+
+            if not self_matches.empty:
+                raise ValueError(
+                    'Full similarity file contains source-target self matches: '
+                    f'{key}'
+                )
+
+            file_source_count = validated_dataframe['source_chembl_id'].nunique()
+
+            if file_source_count != 1:
+                raise ValueError(
+                    'Full similarity file must contain exactly one source '
+                    f'molecule. File={key}, source_count={file_source_count}'
+                )
+
+            file_source_id = str(validated_dataframe['source_chembl_id'].iloc[0])
+            source_ids.add(file_source_id)
+
+            row_count = len(validated_dataframe)
+            row_counts.append(row_count)
+            total_rows += row_count
+
+    assert_positive(
+        value=total_rows,
+        check_name='full similarity parquet total rows',
+    )
+
+    if len(source_ids) != len(similarity_keys):
+        raise ValueError(
+            'Each full similarity file should belong to one unique source '
+            f'molecule. files={len(similarity_keys)}, '
+            f'unique_sources={len(source_ids)}'
+        )
+
+    if len(set(row_counts)) != 1:
+        raise ValueError(
+            'Full similarity files have inconsistent row counts: '
+            f'{sorted(set(row_counts))}'
+        )
+
+    results = {
+        'similarity_files': len(similarity_keys),
+        'similarity_source_molecules': len(source_ids),
+        'similarity_rows': total_rows,
+        'rows_per_similarity_file': row_counts[0],
+    }
+
+    logger.info('Full similarity quality checks passed: %s', results)
+
+    return results
+
+
 def top10_quality_checks(top_n: int = 10) -> dict[str, int]:
     """Run Pandera checks for the combined top-N parquet file."""
-    top_n = int(top_n)
-
-    if top_n < 1:
-        raise ValueError('top_n must be at least 1.')
-
+    top_n = parse_positive_int(top_n, 'top_n')
     s3_client = get_s3_client(aws_conn_id=AWS_CONN_ID)
 
     with TemporaryDirectory(prefix='chembl_top10_quality_') as temp_dir_name:
         temp_dir = Path(temp_dir_name)
-        local_path = temp_dir / 'top10_similar_molecules.parquet'
+        local_path = temp_dir / TOP10_FILE_NAME
 
         download_s3_file(
             s3_client=s3_client,
@@ -417,7 +558,7 @@ def top10_quality_checks(top_n: int = 10) -> dict[str, int]:
 
     results = {
         'top10_rows': len(validated_dataframe),
-        'top10_source_molecules': (
+        'top10_source_molecules': int(
             validated_dataframe['source_chembl_id'].nunique()
         ),
     }
@@ -429,13 +570,14 @@ def top10_quality_checks(top_n: int = 10) -> dict[str, int]:
 
 def gold_quality_checks(top_n: int = 10) -> dict[str, int]:
     """Run quality checks for gold tables and views."""
-    top_n = int(top_n)
-
-    if top_n < 1:
-        raise ValueError('top_n must be at least 1.')
+    top_n = parse_positive_int(top_n, 'top_n')
 
     postgres_hook = PostgresHook(postgres_conn_id=DWH_CONN_ID)
     connection = postgres_hook.get_conn()
+
+    fact_rows = 0
+    dim_rows = 0
+    source_count = 0
 
     try:
         with connection.cursor() as cursor:

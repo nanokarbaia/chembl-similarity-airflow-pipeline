@@ -9,21 +9,25 @@ from typing import Any, Iterable
 
 import requests
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from psycopg2 import sql
 from psycopg2.extras import Json, execute_values
 
 from lib.chembl.bronze_schema import create_standard_bronze_tables
 from lib.chembl.constants import (
     BRONZE_SCHEMA,
     CHEMBL_API_BASE_URL,
+    CHEMBL_API_SOURCE_SYSTEM,
     DEFAULT_CHEMBL_PAGE_LIMIT,
     DWH_CONN_ID,
 )
+from lib.utils.parsing import parse_positive_int
 
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_REQUEST_TIMEOUT = 120
+MAX_BACKOFF_SECONDS = 60
 
 
 def fetch_chembl_page(
@@ -35,6 +39,13 @@ def fetch_chembl_page(
     request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
 ) -> dict[str, Any]:
     """Fetch one page from the ChEMBL API with retry and backoff."""
+    limit = parse_positive_int(limit, 'limit')
+    max_retries = parse_positive_int(max_retries, 'max_retries')
+    request_timeout = parse_positive_int(request_timeout, 'request_timeout')
+
+    if offset < 0:
+        raise ValueError('offset must be zero or greater.')
+
     url = f'{CHEMBL_API_BASE_URL}/{resource}.json'
     params = {
         'limit': limit,
@@ -58,7 +69,11 @@ def fetch_chembl_page(
             requests.Timeout,
         ) as exception:
             last_exception = exception
-            wait_seconds = min(2 ** attempt, 60)
+
+            if attempt == max_retries:
+                break
+
+            wait_seconds = min(2**attempt, MAX_BACKOFF_SECONDS)
 
             logger.warning(
                 'ChEMBL API request failed. '
@@ -80,7 +95,10 @@ def fetch_chembl_page(
             response.raise_for_status()
             return response.json()
 
-        wait_seconds = min(2 ** attempt, 60)
+        if attempt == max_retries:
+            break
+
+        wait_seconds = min(2**attempt, MAX_BACKOFF_SECONDS)
 
         logger.warning(
             'ChEMBL API returned retryable status %s. '
@@ -116,11 +134,8 @@ def fetch_chembl_records(
     page_limit: int = DEFAULT_CHEMBL_PAGE_LIMIT,
 ) -> Iterable[dict[str, Any]]:
     """Fetch records from the ChEMBL API using pagination."""
-    if record_limit < 1:
-        raise ValueError('record_limit must be at least 1.')
-
-    if page_limit < 1:
-        raise ValueError('page_limit must be at least 1.')
+    record_limit = parse_positive_int(record_limit, 'record_limit')
+    page_limit = parse_positive_int(page_limit, 'page_limit')
 
     total_records = 0
     offset = 0
@@ -172,21 +187,25 @@ def insert_rows(
     connection,
     table_name: str,
     columns: list[str],
-    rows: list[tuple],
+    rows: list[tuple[Any, ...]],
 ) -> int:
     """Insert rows into PostgreSQL using execute_values."""
     if not rows:
         return 0
 
-    column_list = ', '.join(columns)
-
-    query = f'''
-        INSERT INTO {BRONZE_SCHEMA}.{table_name} ({column_list})
-        VALUES %s
-    '''
-
     with connection.cursor() as cursor:
-        execute_values(cursor, query, rows, page_size=1000)
+        query = sql.SQL('INSERT INTO {}.{} ({}) VALUES %s').format(
+            sql.Identifier(BRONZE_SCHEMA),
+            sql.Identifier(table_name),
+            sql.SQL(', ').join(sql.Identifier(column) for column in columns),
+        )
+
+        execute_values(
+            cursor,
+            query.as_string(cursor),
+            rows,
+            page_size=1000,
+        )
 
     connection.commit()
 
@@ -200,7 +219,7 @@ def load_chembl_id_lookup_sample(
     loaded_at: datetime,
 ) -> int:
     """Load chembl_id_lookup sample from ChEMBL API."""
-    rows = []
+    rows: list[tuple[Any, ...]] = []
 
     for record in fetch_chembl_records(
         resource='chembl_id_lookup',
@@ -215,7 +234,7 @@ def load_chembl_id_lookup_sample(
                 record.get('status'),
                 record.get('resource_url'),
                 Json(record),
-                'chembl_api',
+                CHEMBL_API_SOURCE_SYSTEM,
                 None,
                 loaded_at,
             )
@@ -245,9 +264,9 @@ def load_molecule_sample(
     loaded_at: datetime,
 ) -> dict[str, int]:
     """Load molecule dictionary, properties and structures from ChEMBL API."""
-    molecule_rows = []
-    property_rows = []
-    structure_rows = []
+    molecule_rows: list[tuple[Any, ...]] = []
+    property_rows: list[tuple[Any, ...]] = []
+    structure_rows: list[tuple[Any, ...]] = []
 
     for record in fetch_chembl_records(
         resource='molecule',
@@ -266,13 +285,14 @@ def load_molecule_sample(
                 record.get('max_phase'),
                 record.get('therapeutic_flag'),
                 Json(record),
-                'chembl_api',
+                CHEMBL_API_SOURCE_SYSTEM,
                 None,
                 loaded_at,
             )
         )
 
         properties = record.get('molecule_properties') or {}
+
         property_rows.append(
             (
                 None,
@@ -286,13 +306,14 @@ def load_molecule_sample(
                 properties.get('aromatic_rings'),
                 properties.get('heavy_atoms'),
                 Json(properties),
-                'chembl_api',
+                CHEMBL_API_SOURCE_SYSTEM,
                 None,
                 loaded_at,
             )
         )
 
         structures = record.get('molecule_structures') or {}
+
         structure_rows.append(
             (
                 None,
@@ -301,7 +322,7 @@ def load_molecule_sample(
                 structures.get('standard_inchi'),
                 structures.get('standard_inchi_key'),
                 Json(structures),
-                'chembl_api',
+                CHEMBL_API_SOURCE_SYSTEM,
                 None,
                 loaded_at,
             )
@@ -376,6 +397,9 @@ def load_chembl_api_sample_to_bronze(
     page_limit: int = DEFAULT_CHEMBL_PAGE_LIMIT,
 ) -> dict[str, int]:
     """Load a limited ChEMBL API sample into bronze tables."""
+    record_limit = parse_positive_int(record_limit, 'record_limit')
+    page_limit = parse_positive_int(page_limit, 'page_limit')
+
     logger.info(
         'Loading ChEMBL API sample. record_limit=%s, page_limit=%s',
         record_limit,

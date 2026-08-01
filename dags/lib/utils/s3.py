@@ -17,6 +17,32 @@ def get_s3_client(aws_conn_id: str) -> Any:
     return s3_hook.get_conn()
 
 
+def normalize_s3_prefix(prefix: str) -> str:
+    """Normalize S3 prefix without leading or trailing slash."""
+    return str(prefix or '').strip().strip('/')
+
+
+def normalize_s3_list_prefix(prefix: str) -> str:
+    """Normalize S3 prefix while preserving an intentional trailing slash."""
+    raw_prefix = str(prefix or '').strip()
+    normalized_prefix = raw_prefix.strip('/')
+
+    if raw_prefix.endswith('/') and normalized_prefix:
+        return f'{normalized_prefix}/'
+
+    return normalized_prefix
+
+
+def build_s3_folder_prefix(prefix: str) -> str:
+    """Build a safe S3 folder prefix ending with one slash."""
+    normalized_prefix = normalize_s3_prefix(prefix)
+
+    if not normalized_prefix:
+        raise ValueError('S3 folder prefix cannot be empty.')
+
+    return f'{normalized_prefix}/'
+
+
 def list_s3_keys(
     s3_client: Any,
     bucket_name: str,
@@ -24,10 +50,15 @@ def list_s3_keys(
     suffix: str | None = None,
 ) -> list[str]:
     """List S3 keys under a prefix."""
+    normalized_prefix = normalize_s3_list_prefix(prefix)
+
     paginator = s3_client.get_paginator('list_objects_v2')
     keys: list[str] = []
 
-    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+    for page in paginator.paginate(
+        Bucket=bucket_name,
+        Prefix=normalized_prefix,
+    ):
         for obj in page.get('Contents', []):
             key = obj['Key']
 
@@ -71,6 +102,9 @@ def upload_s3_file(
     key: str,
 ) -> None:
     """Upload one local file to S3."""
+    if not local_path.is_file():
+        raise FileNotFoundError(f'Local file for S3 upload not found: {local_path}')
+
     logger.info(
         'Uploading %s to s3://%s/%s',
         local_path,
@@ -90,22 +124,28 @@ def delete_s3_prefix(
     bucket_name: str,
     prefix: str,
 ) -> int:
-    """Delete all objects under an S3 prefix."""
+    """Delete all objects under an S3 folder prefix."""
+    folder_prefix = build_s3_folder_prefix(prefix)
+
     keys = list_s3_keys(
         s3_client=s3_client,
         bucket_name=bucket_name,
-        prefix=prefix,
+        prefix=folder_prefix,
     )
 
     if not keys:
-        logger.info('No objects found under s3://%s/%s', bucket_name, prefix)
+        logger.info(
+            'No objects found under s3://%s/%s',
+            bucket_name,
+            folder_prefix,
+        )
         return 0
 
     logger.info(
         'Deleting %s object(s) from s3://%s/%s',
         len(keys),
         bucket_name,
-        prefix,
+        folder_prefix,
     )
 
     for start_index in range(0, len(keys), 1000):

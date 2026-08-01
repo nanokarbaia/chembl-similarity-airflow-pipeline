@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
 import pandas as pd
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator
@@ -22,8 +22,43 @@ from lib.chembl.constants import (
     FINGERPRINTS_S3_PREFIX,
     S3_BUCKET,
 )
+from lib.utils.parsing import normalize_chembl_id, parse_positive_int
+from lib.utils.s3 import (
+    build_s3_folder_prefix,
+    delete_s3_prefix,
+    get_s3_client,
+    upload_s3_file,
+)
 
 logger = logging.getLogger(__name__)
+
+SILVER_MOLECULES_QUERY = """
+SELECT
+    chembl_id,
+    canonical_smiles
+FROM silver.molecules
+WHERE canonical_smiles IS NOT NULL
+ORDER BY chembl_id
+"""
+
+
+@dataclass
+class FingerprintGenerationStats:
+    """Counters collected during fingerprint generation."""
+
+    input_rows: int = 0
+    fingerprints: int = 0
+    invalid_smiles: int = 0
+    files_uploaded: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        """Convert stats to a serializable dictionary."""
+        return {
+            'input_rows': self.input_rows,
+            'fingerprints': self.fingerprints,
+            'invalid_smiles': self.invalid_smiles,
+            'files_uploaded': self.files_uploaded,
+        }
 
 
 def get_morgan_generator() -> Any:
@@ -35,12 +70,21 @@ def get_morgan_generator() -> Any:
 
 
 def compute_fingerprint_row(
-    chembl_id: str,
-    canonical_smiles: str,
+    chembl_id: Any,
+    canonical_smiles: Any,
     generator: Any,
 ) -> dict[str, Any] | None:
     """Compute Morgan fingerprint for one molecule."""
-    molecule = Chem.MolFromSmiles(canonical_smiles)
+    normalized_chembl_id = normalize_chembl_id(chembl_id)
+
+    if normalized_chembl_id is None:
+        return None
+
+    if not canonical_smiles or not str(canonical_smiles).strip():
+        return None
+
+    cleaned_smiles = str(canonical_smiles).strip()
+    molecule = Chem.MolFromSmiles(cleaned_smiles)
 
     if molecule is None:
         return None
@@ -48,8 +92,8 @@ def compute_fingerprint_row(
     fingerprint = generator.GetFingerprint(molecule)
 
     return {
-        'chembl_id': chembl_id,
-        'canonical_smiles': canonical_smiles,
+        'chembl_id': normalized_chembl_id,
+        'canonical_smiles': cleaned_smiles,
         'fingerprint_binary': DataStructs.BitVectToBinaryText(fingerprint),
         'fingerprint_on_bits': int(fingerprint.GetNumOnBits()),
         'fingerprint_radius': FINGERPRINT_RADIUS,
@@ -57,55 +101,18 @@ def compute_fingerprint_row(
     }
 
 
-def delete_existing_fingerprint_files(s3_hook: S3Hook) -> None:
-    """Delete old fingerprint files from S3 prefix before uploading new files."""
-    existing_keys = s3_hook.list_keys(
-        bucket_name=S3_BUCKET,
-        prefix=f'{FINGERPRINTS_S3_PREFIX}/',
-    )
+def build_fingerprint_s3_key(file_count: int) -> str:
+    """Build S3 key for one fingerprint parquet file."""
+    fingerprint_folder_prefix = build_s3_folder_prefix(FINGERPRINTS_S3_PREFIX)
 
-    if not existing_keys:
-        logger.info('No existing fingerprint files found in S3.')
-        return
-
-    logger.info(
-        'Deleting %s existing fingerprint file(s) from s3://%s/%s/',
-        len(existing_keys),
-        S3_BUCKET,
-        FINGERPRINTS_S3_PREFIX,
-    )
-
-    s3_hook.delete_objects(
-        bucket=S3_BUCKET,
-        keys=existing_keys,
-    )
-
-
-def upload_file_to_s3(
-    s3_hook: S3Hook,
-    local_path: Path,
-    s3_key: str,
-) -> None:
-    """Upload a local file to S3."""
-    logger.info(
-        'Uploading fingerprint file to s3://%s/%s',
-        S3_BUCKET,
-        s3_key,
-    )
-
-    s3_hook.load_file(
-        filename=str(local_path),
-        key=s3_key,
-        bucket_name=S3_BUCKET,
-        replace=True,
-    )
+    return f'{fingerprint_folder_prefix}fingerprints_part_{file_count:05d}.parquet'
 
 
 def write_fingerprint_batch(
     fingerprint_rows: list[dict[str, Any]],
     output_dir: Path,
     file_count: int,
-    s3_hook: S3Hook,
+    s3_client: Any,
 ) -> None:
     """Write one fingerprint batch to parquet and upload it to S3."""
     local_path = output_dir / f'fingerprints_part_{file_count:05d}.parquet'
@@ -116,23 +123,107 @@ def write_fingerprint_batch(
         index=False,
     )
 
-    s3_key = (
-        f'{FINGERPRINTS_S3_PREFIX}/'
-        f'fingerprints_part_{file_count:05d}.parquet'
+    s3_key = build_fingerprint_s3_key(file_count)
+
+    upload_s3_file(
+        s3_client=s3_client,
+        bucket_name=S3_BUCKET,
+        local_path=local_path,
+        key=s3_key,
     )
 
-    upload_file_to_s3(
-        s3_hook=s3_hook,
-        local_path=local_path,
-        s3_key=s3_key,
-    )
+
+def process_fingerprint_batch(
+    rows: list[tuple[Any, Any]],
+    generator: Any,
+    stats: FingerprintGenerationStats,
+) -> list[dict[str, Any]]:
+    """Compute fingerprints for one batch of silver molecules."""
+    fingerprint_rows: list[dict[str, Any]] = []
+
+    stats.input_rows += len(rows)
+
+    for chembl_id, canonical_smiles in rows:
+        fingerprint_row = compute_fingerprint_row(
+            chembl_id=chembl_id,
+            canonical_smiles=canonical_smiles,
+            generator=generator,
+        )
+
+        if fingerprint_row is None:
+            stats.invalid_smiles += 1
+            continue
+
+        fingerprint_rows.append(fingerprint_row)
+
+    return fingerprint_rows
+
+
+class FingerprintGeneratorService:
+    """Generate Morgan fingerprints from silver molecules and store them in S3."""
+
+    def __init__(
+        self,
+        batch_size: int,
+        output_dir: Path,
+    ) -> None:
+        self.batch_size = parse_positive_int(batch_size, 'batch_size')
+        self.output_dir = output_dir
+        self.generator = get_morgan_generator()
+        self.stats = FingerprintGenerationStats()
+        self.s3_client = get_s3_client(aws_conn_id=AWS_CONN_ID)
+
+    def clear_existing_outputs(self) -> None:
+        """Delete old fingerprint files from the S3 output prefix."""
+        delete_s3_prefix(
+            s3_client=self.s3_client,
+            bucket_name=S3_BUCKET,
+            prefix=build_s3_folder_prefix(FINGERPRINTS_S3_PREFIX),
+        )
+
+    def write_batch(self, fingerprint_rows: list[dict[str, Any]]) -> None:
+        """Write a computed fingerprint batch to S3."""
+        write_fingerprint_batch(
+            fingerprint_rows=fingerprint_rows,
+            output_dir=self.output_dir,
+            file_count=self.stats.files_uploaded,
+            s3_client=self.s3_client,
+        )
+
+        self.stats.fingerprints += len(fingerprint_rows)
+        self.stats.files_uploaded += 1
+
+    def process_rows(self, rows: list[tuple[Any, Any]]) -> None:
+        """Process one database batch and upload it if fingerprints exist."""
+        fingerprint_rows = process_fingerprint_batch(
+            rows=rows,
+            generator=self.generator,
+            stats=self.stats,
+        )
+
+        if not fingerprint_rows:
+            logger.warning(
+                'Skipped a batch because no valid fingerprints were generated.'
+            )
+            return
+
+        self.write_batch(fingerprint_rows)
+
+        logger.info(
+            'Processed input rows=%s, valid fingerprints=%s, '
+            'invalid_smiles=%s, files_uploaded=%s',
+            self.stats.input_rows,
+            self.stats.fingerprints,
+            self.stats.invalid_smiles,
+            self.stats.files_uploaded,
+        )
 
 
 def compute_and_upload_fingerprints(
     batch_size: int = DEFAULT_FINGERPRINT_BATCH_SIZE,
 ) -> dict[str, int]:
     """Compute Morgan fingerprints for silver molecules and upload to S3."""
-    batch_size = int(batch_size)
+    batch_size = parse_positive_int(batch_size, 'batch_size')
 
     logger.info(
         'Starting fingerprint calculation. radius=%s, n_bits=%s, batch_size=%s',
@@ -142,34 +233,22 @@ def compute_and_upload_fingerprints(
     )
 
     postgres_hook = PostgresHook(postgres_conn_id=DWH_CONN_ID)
-    s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
-    generator = get_morgan_generator()
-
-    total_input_rows = 0
-    total_fingerprints = 0
-    invalid_smiles = 0
-    file_count = 0
-
-    delete_existing_fingerprint_files(s3_hook)
-
     connection = postgres_hook.get_conn()
 
     try:
         with TemporaryDirectory(prefix='chembl_fingerprints_') as temp_dir:
-            output_dir = Path(temp_dir)
+            service = FingerprintGeneratorService(
+                batch_size=batch_size,
+                output_dir=Path(temp_dir),
+            )
 
-            with connection.cursor(name='silver_molecule_fingerprint_cursor') as cursor:
+            service.clear_existing_outputs()
+
+            with connection.cursor(
+                name='silver_molecule_fingerprint_cursor'
+            ) as cursor:
                 cursor.itersize = batch_size
-                cursor.execute(
-                    """
-                    SELECT
-                        chembl_id,
-                        canonical_smiles
-                    FROM silver.molecules
-                    WHERE canonical_smiles IS NOT NULL
-                    ORDER BY chembl_id
-                    """
-                )
+                cursor.execute(SILVER_MOLECULES_QUERY)
 
                 while True:
                     rows = cursor.fetchmany(batch_size)
@@ -177,55 +256,15 @@ def compute_and_upload_fingerprints(
                     if not rows:
                         break
 
-                    total_input_rows += len(rows)
-                    fingerprint_rows = []
+                    service.process_rows(rows)
 
-                    for chembl_id, canonical_smiles in rows:
-                        fingerprint_row = compute_fingerprint_row(
-                            chembl_id=chembl_id,
-                            canonical_smiles=canonical_smiles,
-                            generator=generator,
-                        )
+            if service.stats.fingerprints == 0:
+                raise ValueError('No fingerprints were generated.')
 
-                        if fingerprint_row is None:
-                            invalid_smiles += 1
-                            continue
-
-                        fingerprint_rows.append(fingerprint_row)
-
-                    if not fingerprint_rows:
-                        continue
-
-                    write_fingerprint_batch(
-                        fingerprint_rows=fingerprint_rows,
-                        output_dir=output_dir,
-                        file_count=file_count,
-                        s3_hook=s3_hook,
-                    )
-
-                    total_fingerprints += len(fingerprint_rows)
-                    file_count += 1
-
-                    logger.info(
-                        'Processed input rows=%s, valid fingerprints=%s, '
-                        'invalid_smiles=%s',
-                        total_input_rows,
-                        total_fingerprints,
-                        invalid_smiles,
-                    )
+            result = service.stats.to_dict()
 
     finally:
         connection.close()
-
-    if total_fingerprints == 0:
-        raise ValueError('No fingerprints were generated.')
-
-    result = {
-        'input_rows': total_input_rows,
-        'fingerprints': total_fingerprints,
-        'invalid_smiles': invalid_smiles,
-        'files_uploaded': file_count,
-    }
 
     logger.info('Finished fingerprint calculation: %s', result)
 

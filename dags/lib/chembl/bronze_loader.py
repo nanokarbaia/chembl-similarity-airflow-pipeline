@@ -5,33 +5,62 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import os
+import shutil
 import sqlite3
 import tarfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from psycopg2 import sql
 
 from lib.chembl.bronze_schema import create_standard_bronze_tables
 from lib.chembl.constants import (
     BRONZE_SCHEMA,
     CHEMBL_CACHE_DIR,
     CHEMBL_FTP_BASE_URL,
+    CHEMBL_SQLITE_SOURCE_SYSTEM,
     DEFAULT_CHEMBL_VERSION,
     DEFAULT_LOAD_BATCH_SIZE,
+    DOWNLOAD_BACKOFF_SECONDS,
+    DOWNLOAD_CHUNK_SIZE_BYTES,
+    DOWNLOAD_CONNECT_TIMEOUT_SECONDS,
+    DOWNLOAD_PROGRESS_STEP_BYTES,
+    DOWNLOAD_READ_TIMEOUT_SECONDS,
+    DOWNLOAD_RETRIES,
     DWH_CONN_ID,
 )
+from lib.utils.parsing import normalize_text, parse_positive_int
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class ChEMBLLoadContext:
+    """Runtime context for a ChEMBL bronze load."""
+
+    chembl_version: str
+    loaded_at: datetime
+    record_limit: int | None
+
+
 def get_chembl_version(chembl_version: str | None = None) -> str:
     """Return ChEMBL version used for full ingestion."""
-    return str(chembl_version or DEFAULT_CHEMBL_VERSION).replace('chembl_', '')
+    normalized_version = normalize_text(chembl_version)
+
+    if normalized_version is None:
+        normalized_version = DEFAULT_CHEMBL_VERSION
+
+    normalized_version = normalized_version.lower().replace('chembl_', '').strip()
+
+    if not normalized_version:
+        raise ValueError('ChEMBL version cannot be empty.')
+
+    return normalized_version
 
 
 def get_chembl_sqlite_url(chembl_version: str) -> str:
@@ -42,97 +71,130 @@ def get_chembl_sqlite_url(chembl_version: str) -> str:
     )
 
 
+def validate_record_limit(record_limit: int | None) -> int | None:
+    """Validate optional record limit."""
+    if record_limit is None:
+        return None
+
+    return parse_positive_int(
+        value=record_limit,
+        parameter_name='record_limit',
+    )
+
+
+def quote_sqlite_identifier(identifier: str) -> str:
+    """Quote SQLite identifier safely."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 def download_with_resume(
     url: str,
     destination_path: Path,
-    retries: int = 5,
-    chunk_size: int = 1024 * 1024,
+    retries: int = DOWNLOAD_RETRIES,
+    chunk_size: int = DOWNLOAD_CHUNK_SIZE_BYTES,
 ) -> Path:
     """Download a large file with resume support."""
+    retries = parse_positive_int(retries, 'retries')
+    chunk_size = parse_positive_int(chunk_size, 'chunk_size')
+
     destination_path.parent.mkdir(parents=True, exist_ok=True)
-    partial_path = destination_path.with_suffix(destination_path.suffix + '.part')
+    partial_path = destination_path.with_suffix(f'{destination_path.suffix}.part')
 
     if destination_path.exists() and destination_path.stat().st_size > 0:
         logger.info('Archive already exists: %s', destination_path)
         return destination_path
 
-    for attempt in range(1, retries + 1):
-        existing_size = partial_path.stat().st_size if partial_path.exists() else 0
-        headers = {}
-
-        if existing_size > 0:
-            headers['Range'] = f'bytes={existing_size}-'
-            logger.info(
-                'Resuming download from byte %s. Attempt %s/%s',
-                existing_size,
-                attempt,
-                retries,
+    with requests.Session() as session:
+        for attempt in range(1, retries + 1):
+            existing_size = (
+                partial_path.stat().st_size
+                if partial_path.exists()
+                else 0
             )
-        else:
-            logger.info('Starting download. Attempt %s/%s', attempt, retries)
+            headers = {}
 
-        try:
-            with requests.get(
-                url,
-                headers=headers,
-                stream=True,
-                timeout=(30, 300),
-            ) as response:
-                response.raise_for_status()
+            if existing_size > 0:
+                headers['Range'] = f'bytes={existing_size}-'
+                logger.info(
+                    'Resuming download from byte %s. Attempt %s/%s',
+                    existing_size,
+                    attempt,
+                    retries,
+                )
+            else:
+                logger.info('Starting download. Attempt %s/%s', attempt, retries)
 
-                mode = 'ab' if response.status_code == 206 else 'wb'
+            try:
+                with session.get(
+                    url,
+                    headers=headers,
+                    stream=True,
+                    timeout=(
+                        DOWNLOAD_CONNECT_TIMEOUT_SECONDS,
+                        DOWNLOAD_READ_TIMEOUT_SECONDS,
+                    ),
+                ) as response:
+                    response.raise_for_status()
 
-                if response.status_code == 200 and existing_size > 0:
-                    logger.warning(
-                        'Server did not resume download. Restarting from zero.'
-                    )
+                    mode = 'ab' if response.status_code == 206 else 'wb'
 
-                bytes_written = existing_size if mode == 'ab' else 0
-                last_logged_size = bytes_written
+                    if response.status_code == 200 and existing_size > 0:
+                        logger.warning(
+                            'Server did not resume download. '
+                            'Restarting from zero.'
+                        )
 
-                with partial_path.open(mode) as file:
-                    for chunk in response.iter_content(chunk_size=chunk_size):
-                        if not chunk:
-                            continue
+                    bytes_written = existing_size if mode == 'ab' else 0
+                    last_logged_size = bytes_written
 
-                        file.write(chunk)
-                        bytes_written += len(chunk)
+                    with partial_path.open(mode) as file:
+                        for chunk in response.iter_content(chunk_size=chunk_size):
+                            if not chunk:
+                                continue
 
-                        if bytes_written - last_logged_size >= 100 * 1024 * 1024:
-                            logger.info(
-                                'Downloaded %.2f GB',
-                                bytes_written / 1024 / 1024 / 1024,
-                            )
-                            last_logged_size = bytes_written
+                            file.write(chunk)
+                            bytes_written += len(chunk)
 
-            partial_path.rename(destination_path)
-            logger.info('Download finished: %s', destination_path)
+                            if (
+                                bytes_written - last_logged_size
+                                >= DOWNLOAD_PROGRESS_STEP_BYTES
+                            ):
+                                logger.info(
+                                    'Downloaded %.2f GB',
+                                    bytes_written / 1024 / 1024 / 1024,
+                                )
+                                last_logged_size = bytes_written
 
-            return destination_path
+                partial_path.rename(destination_path)
+                logger.info('Download finished: %s', destination_path)
 
-        except Exception as exc:
-            logger.warning(
-                'Download attempt %s/%s failed: %s',
-                attempt,
-                retries,
-                exc,
-            )
+                return destination_path
 
-            if attempt == retries:
-                raise
+            except (requests.RequestException, OSError) as exc:
+                logger.warning(
+                    'Download attempt %s/%s failed: %s',
+                    attempt,
+                    retries,
+                    exc,
+                )
 
-            time.sleep(30 * attempt)
+                if attempt == retries:
+                    raise
+
+                time.sleep(DOWNLOAD_BACKOFF_SECONDS * attempt)
 
     raise RuntimeError(f'Could not download file from {url}')
 
 
 def find_extracted_sqlite_file(extract_dir: Path) -> Path:
     """Find SQLite database file after archive extraction."""
-    candidates = [
-        *extract_dir.rglob('*.db'),
-        *extract_dir.rglob('*.sqlite'),
-        *extract_dir.rglob('*.sqlite3'),
-    ]
+    candidates = sorted(
+        [
+            *extract_dir.rglob('*.db'),
+            *extract_dir.rglob('*.sqlite'),
+            *extract_dir.rglob('*.sqlite3'),
+        ]
+    )
 
     if not candidates:
         raise FileNotFoundError(f'No SQLite database found under {extract_dir}')
@@ -140,23 +202,67 @@ def find_extracted_sqlite_file(extract_dir: Path) -> Path:
     return candidates[0]
 
 
+def validate_tar_member_path(extract_dir: Path, member: tarfile.TarInfo) -> None:
+    """Validate that tar member will be extracted safely."""
+    extract_dir_path = extract_dir.resolve()
+    member_path = (extract_dir / member.name).resolve()
+
+    if not member_path.is_relative_to(extract_dir_path):
+        raise ValueError(
+            f'Unsafe path detected in ChEMBL archive: {member.name}'
+        )
+
+    if member.issym() or member.islnk():
+        raise ValueError(
+            f'Unsafe link detected in ChEMBL archive: {member.name}'
+        )
+
+    if member.isdev():
+        raise ValueError(
+            f'Unsafe device file detected in ChEMBL archive: {member.name}'
+        )
+
+
+def safe_extract_tar_archive(archive_path: Path, extract_dir: Path) -> None:
+    """Safely extract a tar archive into a target directory."""
+    with tarfile.open(archive_path, 'r:gz') as archive:
+        for member in archive.getmembers():
+            validate_tar_member_path(
+                extract_dir=extract_dir,
+                member=member,
+            )
+
+        archive.extractall(extract_dir)
+
+
 def extract_sqlite_archive(archive_path: Path, chembl_version: str) -> Path:
     """Extract ChEMBL SQLite archive and return SQLite database path."""
     extract_dir = Path(CHEMBL_CACHE_DIR) / f'chembl_{chembl_version}_sqlite'
 
     if extract_dir.exists():
-        sqlite_path = find_extracted_sqlite_file(extract_dir)
-        logger.info('SQLite database already extracted: %s', sqlite_path)
-        return sqlite_path
+        try:
+            sqlite_path = find_extracted_sqlite_file(extract_dir)
+            logger.info('SQLite database already extracted: %s', sqlite_path)
+            return sqlite_path
+        except FileNotFoundError:
+            logger.warning(
+                'Existing extraction directory has no SQLite file. '
+                'Re-extracting: %s',
+                extract_dir,
+            )
+            shutil.rmtree(extract_dir)
 
     extract_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        with tarfile.open(archive_path, 'r:gz') as archive:
-            archive.extractall(extract_dir)
-    except tarfile.TarError:
-        logger.exception('Archive is corrupted. Deleting archive: %s', archive_path)
+        safe_extract_tar_archive(
+            archive_path=archive_path,
+            extract_dir=extract_dir,
+        )
+    except (tarfile.TarError, ValueError):
+        logger.exception('Archive extraction failed: %s', archive_path)
         archive_path.unlink(missing_ok=True)
+        shutil.rmtree(extract_dir, ignore_errors=True)
         raise
 
     sqlite_path = find_extracted_sqlite_file(extract_dir)
@@ -191,7 +297,8 @@ def ensure_chembl_sqlite(chembl_version: str | None = None) -> tuple[str, Path]:
 
 def get_sqlite_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
     """Return available columns for a SQLite table."""
-    cursor = connection.execute(f'PRAGMA table_info("{table_name}")')
+    quoted_table_name = quote_sqlite_identifier(table_name)
+    cursor = connection.execute(f'PRAGMA table_info({quoted_table_name})')
     rows = cursor.fetchall()
 
     if not rows:
@@ -206,16 +313,19 @@ def column_or_null(
     alias: str | None = None,
     table_alias: str | None = None,
 ) -> str:
-    """Return SQLite column expression or NULL if the column does not exist."""
+    """Return SQLite column expression or NULL if column does not exist."""
     output_alias = alias or column_name
+    quoted_alias = quote_sqlite_identifier(output_alias)
 
     if column_name not in available_columns:
-        return f'NULL AS "{output_alias}"'
+        return f'NULL AS {quoted_alias}'
+
+    quoted_column = quote_sqlite_identifier(column_name)
 
     if table_alias:
-        return f'{table_alias}."{column_name}" AS "{output_alias}"'
+        return f'{table_alias}.{quoted_column} AS {quoted_alias}'
 
-    return f'"{column_name}" AS "{output_alias}"'
+    return f'{quoted_column} AS {quoted_alias}'
 
 
 def copy_rows(
@@ -224,7 +334,7 @@ def copy_rows(
     columns: list[str],
     rows: list[tuple[Any, ...]],
 ) -> int:
-    """Copy rows into PostgreSQL bronze table."""
+    """Copy rows into a PostgreSQL bronze table."""
     if not rows:
         return 0
 
@@ -233,15 +343,16 @@ def copy_rows(
     writer.writerows(rows)
     output.seek(0)
 
-    column_list = ', '.join(f'"{column}"' for column in columns)
-
-    copy_statement = f'''
-        COPY {BRONZE_SCHEMA}.{table_name} ({column_list})
-        FROM STDIN WITH (FORMAT CSV)
-    '''
-
     with connection.cursor() as cursor:
-        cursor.copy_expert(copy_statement, output)
+        copy_statement = sql.SQL(
+            'COPY {}.{} ({}) FROM STDIN WITH (FORMAT CSV)'
+        ).format(
+            sql.Identifier(BRONZE_SCHEMA),
+            sql.Identifier(table_name),
+            sql.SQL(', ').join(sql.Identifier(column) for column in columns),
+        )
+
+        cursor.copy_expert(copy_statement.as_string(cursor), output)
 
     connection.commit()
 
@@ -252,12 +363,15 @@ def stream_sqlite_query_to_postgres(
     sqlite_connection: sqlite3.Connection,
     postgres_connection,
     query: str,
+    query_parameters: tuple[Any, ...],
     table_name: str,
     columns: list[str],
     batch_size: int = DEFAULT_LOAD_BATCH_SIZE,
 ) -> int:
     """Stream SQLite query result into PostgreSQL."""
-    cursor = sqlite_connection.execute(query)
+    batch_size = parse_positive_int(batch_size, 'batch_size')
+
+    cursor = sqlite_connection.execute(query, query_parameters)
     total_rows = 0
 
     while True:
@@ -279,15 +393,31 @@ def stream_sqlite_query_to_postgres(
     return total_rows
 
 
+def add_optional_limit(
+    query: str,
+    query_parameters: list[Any],
+    record_limit: int | None,
+) -> tuple[str, tuple[Any, ...]]:
+    """Add optional LIMIT clause to a SQLite query."""
+    if record_limit is None:
+        return query, tuple(query_parameters)
+
+    query = f'{query}\nLIMIT ?'
+    query_parameters.append(record_limit)
+
+    return query, tuple(query_parameters)
+
+
 def load_chembl_id_lookup(
     sqlite_connection: sqlite3.Connection,
     postgres_connection,
-    chembl_version: str,
-    record_limit: int | None,
-    loaded_at: datetime,
+    context: ChEMBLLoadContext,
 ) -> int:
     """Load chembl_id_lookup from SQLite into bronze."""
-    available_columns = get_sqlite_columns(sqlite_connection, 'chembl_id_lookup')
+    available_columns = get_sqlite_columns(
+        sqlite_connection,
+        'chembl_id_lookup',
+    )
 
     query = f'''
         SELECT
@@ -296,19 +426,27 @@ def load_chembl_id_lookup(
             {column_or_null(available_columns, 'status')},
             {column_or_null(available_columns, 'resource_url')},
             NULL AS raw_record,
-            'chembl_sqlite_dump' AS source_system,
-            '{chembl_version}' AS source_chembl_version,
-            '{loaded_at.isoformat()}' AS loaded_at
+            ? AS source_system,
+            ? AS source_chembl_version,
+            ? AS loaded_at
         FROM chembl_id_lookup
     '''
 
-    if record_limit is not None:
-        query = f'{query} LIMIT {int(record_limit)}'
+    query, query_parameters = add_optional_limit(
+        query=query,
+        query_parameters=[
+            CHEMBL_SQLITE_SOURCE_SYSTEM,
+            context.chembl_version,
+            context.loaded_at.isoformat(),
+        ],
+        record_limit=context.record_limit,
+    )
 
     return stream_sqlite_query_to_postgres(
         sqlite_connection=sqlite_connection,
         postgres_connection=postgres_connection,
         query=query,
+        query_parameters=query_parameters,
         table_name='chembl_id_lookup',
         columns=[
             'chembl_id',
@@ -326,12 +464,13 @@ def load_chembl_id_lookup(
 def load_molecule_dictionary(
     sqlite_connection: sqlite3.Connection,
     postgres_connection,
-    chembl_version: str,
-    record_limit: int | None,
-    loaded_at: datetime,
+    context: ChEMBLLoadContext,
 ) -> int:
     """Load molecule_dictionary from SQLite into bronze."""
-    available_columns = get_sqlite_columns(sqlite_connection, 'molecule_dictionary')
+    available_columns = get_sqlite_columns(
+        sqlite_connection,
+        'molecule_dictionary',
+    )
 
     query = f'''
         SELECT
@@ -342,19 +481,27 @@ def load_molecule_dictionary(
             {column_or_null(available_columns, 'max_phase')},
             {column_or_null(available_columns, 'therapeutic_flag')},
             NULL AS raw_record,
-            'chembl_sqlite_dump' AS source_system,
-            '{chembl_version}' AS source_chembl_version,
-            '{loaded_at.isoformat()}' AS loaded_at
+            ? AS source_system,
+            ? AS source_chembl_version,
+            ? AS loaded_at
         FROM molecule_dictionary
     '''
 
-    if record_limit is not None:
-        query = f'{query} LIMIT {int(record_limit)}'
+    query, query_parameters = add_optional_limit(
+        query=query,
+        query_parameters=[
+            CHEMBL_SQLITE_SOURCE_SYSTEM,
+            context.chembl_version,
+            context.loaded_at.isoformat(),
+        ],
+        record_limit=context.record_limit,
+    )
 
     return stream_sqlite_query_to_postgres(
         sqlite_connection=sqlite_connection,
         postgres_connection=postgres_connection,
         query=query,
+        query_parameters=query_parameters,
         table_name='molecule_dictionary',
         columns=[
             'molregno',
@@ -374,12 +521,13 @@ def load_molecule_dictionary(
 def load_compound_properties(
     sqlite_connection: sqlite3.Connection,
     postgres_connection,
-    chembl_version: str,
-    record_limit: int | None,
-    loaded_at: datetime,
+    context: ChEMBLLoadContext,
 ) -> int:
     """Load compound_properties from SQLite into bronze."""
-    cp_columns = get_sqlite_columns(sqlite_connection, 'compound_properties')
+    cp_columns = get_sqlite_columns(
+        sqlite_connection,
+        'compound_properties',
+    )
 
     query = f'''
         SELECT
@@ -394,21 +542,29 @@ def load_compound_properties(
             {column_or_null(cp_columns, 'aromatic_rings', table_alias='cp')},
             {column_or_null(cp_columns, 'heavy_atoms', table_alias='cp')},
             NULL AS raw_record,
-            'chembl_sqlite_dump' AS source_system,
-            '{chembl_version}' AS source_chembl_version,
-            '{loaded_at.isoformat()}' AS loaded_at
+            ? AS source_system,
+            ? AS source_chembl_version,
+            ? AS loaded_at
         FROM compound_properties cp
         JOIN molecule_dictionary md
             ON cp.molregno = md.molregno
     '''
 
-    if record_limit is not None:
-        query = f'{query} LIMIT {int(record_limit)}'
+    query, query_parameters = add_optional_limit(
+        query=query,
+        query_parameters=[
+            CHEMBL_SQLITE_SOURCE_SYSTEM,
+            context.chembl_version,
+            context.loaded_at.isoformat(),
+        ],
+        record_limit=context.record_limit,
+    )
 
     return stream_sqlite_query_to_postgres(
         sqlite_connection=sqlite_connection,
         postgres_connection=postgres_connection,
         query=query,
+        query_parameters=query_parameters,
         table_name='compound_properties',
         columns=[
             'molregno',
@@ -432,12 +588,13 @@ def load_compound_properties(
 def load_compound_structures(
     sqlite_connection: sqlite3.Connection,
     postgres_connection,
-    chembl_version: str,
-    record_limit: int | None,
-    loaded_at: datetime,
+    context: ChEMBLLoadContext,
 ) -> int:
     """Load compound_structures from SQLite into bronze."""
-    cs_columns = get_sqlite_columns(sqlite_connection, 'compound_structures')
+    cs_columns = get_sqlite_columns(
+        sqlite_connection,
+        'compound_structures',
+    )
 
     query = f'''
         SELECT
@@ -447,21 +604,29 @@ def load_compound_structures(
             {column_or_null(cs_columns, 'standard_inchi', table_alias='cs')},
             {column_or_null(cs_columns, 'standard_inchi_key', table_alias='cs')},
             NULL AS raw_record,
-            'chembl_sqlite_dump' AS source_system,
-            '{chembl_version}' AS source_chembl_version,
-            '{loaded_at.isoformat()}' AS loaded_at
+            ? AS source_system,
+            ? AS source_chembl_version,
+            ? AS loaded_at
         FROM compound_structures cs
         JOIN molecule_dictionary md
             ON cs.molregno = md.molregno
     '''
 
-    if record_limit is not None:
-        query = f'{query} LIMIT {int(record_limit)}'
+    query, query_parameters = add_optional_limit(
+        query=query,
+        query_parameters=[
+            CHEMBL_SQLITE_SOURCE_SYSTEM,
+            context.chembl_version,
+            context.loaded_at.isoformat(),
+        ],
+        record_limit=context.record_limit,
+    )
 
     return stream_sqlite_query_to_postgres(
         sqlite_connection=sqlite_connection,
         postgres_connection=postgres_connection,
         query=query,
+        query_parameters=query_parameters,
         table_name='compound_structures',
         columns=[
             'molregno',
@@ -477,6 +642,45 @@ def load_compound_structures(
     )
 
 
+class ChEMBLBronzeLoader:
+    """Load required ChEMBL SQLite tables into the bronze DWH layer."""
+
+    def __init__(
+        self,
+        postgres_connection,
+        sqlite_connection: sqlite3.Connection,
+        context: ChEMBLLoadContext,
+    ) -> None:
+        self.postgres_connection = postgres_connection
+        self.sqlite_connection = sqlite_connection
+        self.context = context
+
+    def load(self) -> dict[str, int]:
+        """Load all required ChEMBL tables."""
+        return {
+            'chembl_id_lookup': load_chembl_id_lookup(
+                sqlite_connection=self.sqlite_connection,
+                postgres_connection=self.postgres_connection,
+                context=self.context,
+            ),
+            'molecule_dictionary': load_molecule_dictionary(
+                sqlite_connection=self.sqlite_connection,
+                postgres_connection=self.postgres_connection,
+                context=self.context,
+            ),
+            'compound_properties': load_compound_properties(
+                sqlite_connection=self.sqlite_connection,
+                postgres_connection=self.postgres_connection,
+                context=self.context,
+            ),
+            'compound_structures': load_compound_structures(
+                sqlite_connection=self.sqlite_connection,
+                postgres_connection=self.postgres_connection,
+                context=self.context,
+            ),
+        }
+
+
 def load_required_chembl_tables_to_bronze(
     chembl_version: str | None = None,
     record_limit: int | None = None,
@@ -484,44 +688,26 @@ def load_required_chembl_tables_to_bronze(
     """Load required ChEMBL SQLite tables into PostgreSQL bronze."""
     resolved_version, sqlite_path = ensure_chembl_sqlite(chembl_version)
 
+    context = ChEMBLLoadContext(
+        chembl_version=resolved_version,
+        loaded_at=datetime.now(timezone.utc),
+        record_limit=validate_record_limit(record_limit),
+    )
+
     postgres_hook = PostgresHook(postgres_conn_id=DWH_CONN_ID)
     postgres_connection = postgres_hook.get_conn()
-    loaded_at = datetime.now(timezone.utc)
 
     try:
         create_standard_bronze_tables(postgres_connection)
 
         with sqlite3.connect(sqlite_path) as sqlite_connection:
-            result = {
-                'chembl_id_lookup': load_chembl_id_lookup(
-                    sqlite_connection=sqlite_connection,
-                    postgres_connection=postgres_connection,
-                    chembl_version=resolved_version,
-                    record_limit=record_limit,
-                    loaded_at=loaded_at,
-                ),
-                'molecule_dictionary': load_molecule_dictionary(
-                    sqlite_connection=sqlite_connection,
-                    postgres_connection=postgres_connection,
-                    chembl_version=resolved_version,
-                    record_limit=record_limit,
-                    loaded_at=loaded_at,
-                ),
-                'compound_properties': load_compound_properties(
-                    sqlite_connection=sqlite_connection,
-                    postgres_connection=postgres_connection,
-                    chembl_version=resolved_version,
-                    record_limit=record_limit,
-                    loaded_at=loaded_at,
-                ),
-                'compound_structures': load_compound_structures(
-                    sqlite_connection=sqlite_connection,
-                    postgres_connection=postgres_connection,
-                    chembl_version=resolved_version,
-                    record_limit=record_limit,
-                    loaded_at=loaded_at,
-                ),
-            }
+            loader = ChEMBLBronzeLoader(
+                postgres_connection=postgres_connection,
+                sqlite_connection=sqlite_connection,
+                context=context,
+            )
+
+            result = loader.load()
 
         logger.info('Finished full ChEMBL bronze load: %s', result)
 
