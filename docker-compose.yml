@@ -6,15 +6,17 @@ x-airflow-common:
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
     AIRFLOW__API__BASE_URL: http://airflow-webserver:8080
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_POSTGRES_USER:-airflow}:${AIRFLOW_POSTGRES_PASSWORD:-airflow}@postgres/${AIRFLOW_POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
-    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'false'
     AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
-    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_SIMPLE_AUTH_USERS:-admin:admin}
+
+    AIRFLOW_PUBLIC_BASE_URL: ${AIRFLOW_PUBLIC_BASE_URL:-http://localhost:8082}
 
     AIRFLOW_CONN_DWH_POSTGRES: ${AIRFLOW_CONN_DWH_POSTGRES}
     AIRFLOW_CONN_AWS_S3: ${AIRFLOW_CONN_AWS_S3}
@@ -27,12 +29,13 @@ x-airflow-common:
 
     S3_BUCKET: ${S3_BUCKET:-de-school-educational-data}
     S3_BASE_PREFIX: ${S3_BASE_PREFIX:-final_task/karbaia_nano}
+    SOURCE_INPUT_PREFIX: ${SOURCE_INPUT_PREFIX:-final_task/karbaia_nano/input}
 
     CHEMBL_CACHE_DIR: /opt/airflow/chembl_cache
     PYSTOW_HOME: /opt/airflow/chembl_cache
 
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
-    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    AIRFLOW_CONFIG: /opt/airflow/config/airflow.cfg
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
@@ -54,13 +57,13 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
+      POSTGRES_USER: ${AIRFLOW_POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${AIRFLOW_POSTGRES_DB:-airflow}
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
+      test: ["CMD", "pg_isready", "-U", "${AIRFLOW_POSTGRES_USER:-airflow}"]
       interval: 10s
       retries: 5
       start_period: 5s
@@ -69,15 +72,15 @@ services:
   dwh-postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: chembl
-      POSTGRES_PASSWORD: chembl
-      POSTGRES_DB: chembl
+      POSTGRES_USER: ${DWH_POSTGRES_USER:-chembl}
+      POSTGRES_PASSWORD: ${DWH_POSTGRES_PASSWORD:-chembl}
+      POSTGRES_DB: ${DWH_POSTGRES_DB:-chembl}
     ports:
       - "5436:5432"
     volumes:
       - dwh-postgres-volume:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "chembl"]
+      test: ["CMD", "pg_isready", "-U", "${DWH_POSTGRES_USER:-chembl}"]
       interval: 10s
       retries: 5
       start_period: 5s
@@ -91,7 +94,10 @@ services:
     volumes:
       - ${AIRFLOW_PROJ_DIR:-.}/migrations:/migrations
     environment:
-      PGPASSWORD: chembl
+      DWH_POSTGRES_USER: ${DWH_POSTGRES_USER:-chembl}
+      DWH_POSTGRES_PASSWORD: ${DWH_POSTGRES_PASSWORD:-chembl}
+      DWH_POSTGRES_DB: ${DWH_POSTGRES_DB:-chembl}
+      PGPASSWORD: ${DWH_POSTGRES_PASSWORD:-chembl}
     command:
       - bash
       - -c
@@ -99,10 +105,19 @@ services:
         set -e
 
         for file in /migrations/*.sql; do
-          if [ -f "$$file" ]; then
-            echo "Applying migration: $$file"
-            psql -h dwh-postgres -U chembl -d chembl -f "$$file"
+          if [ ! -f "$$file" ]; then
+            continue
           fi
+
+          case "$$file" in
+            *.rollback.sql)
+              echo "Skipping rollback migration: $$file"
+              continue
+              ;;
+          esac
+
+          echo "Applying migration: $$file"
+          psql -h dwh-postgres -U "$$DWH_POSTGRES_USER" -d "$$DWH_POSTGRES_DB" -f "$$file"
         done
     restart: "no"
 

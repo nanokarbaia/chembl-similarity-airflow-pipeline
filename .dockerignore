@@ -16,3 +16,5 @@ __pycache__
 .idea
 .vscode
 config/airflow.cfg
+
+chembl_cache/
