@@ -8,13 +8,13 @@ import pytest
 from lib.chembl.gold import (
     build_pivot_view_sql,
     dataframe_to_fact_records,
-    normalize_chembl_id,
     validate_top10_dataframe,
 )
+from lib.utils.parsing import normalize_chembl_id
 
 
 def make_top10_dataframe() -> pd.DataFrame:
-    """Create valid top-10-like dataframe for tests."""
+    """Create valid top-N-like dataframe for tests."""
     return pd.DataFrame(
         {
             'source_chembl_id': [' chembl10 ', 'CHEMBL10'],
@@ -88,6 +88,22 @@ def test_validate_top10_dataframe_rejects_invalid_similarity_score() -> None:
         validate_top10_dataframe(dataframe)
 
 
+def test_validate_top10_dataframe_rejects_duplicate_ranks() -> None:
+    dataframe = make_top10_dataframe()
+    dataframe.loc[1, 'similarity_rank'] = 1
+
+    with pytest.raises(ValueError, match='Duplicate similarity ranks'):
+        validate_top10_dataframe(dataframe)
+
+
+def test_validate_top10_dataframe_rejects_non_sequential_ranks() -> None:
+    dataframe = make_top10_dataframe()
+    dataframe.loc[1, 'similarity_rank'] = 3
+
+    with pytest.raises(ValueError, match='invalid rank sequence'):
+        validate_top10_dataframe(dataframe)
+
+
 def test_dataframe_to_fact_records() -> None:
     dataframe = validate_top10_dataframe(make_top10_dataframe())
 
@@ -100,17 +116,16 @@ def test_dataframe_to_fact_records() -> None:
 
 
 def test_build_pivot_view_sql_contains_expected_columns() -> None:
-    sql = build_pivot_view_sql(['CHEMBL10', 'CHEMBL11'])
+    pivot_sql = build_pivot_view_sql(['CHEMBL10', 'CHEMBL11'])
 
-    assert 'CREATE OR REPLACE VIEW gold.vw_similarity_pivot_10_sources' in sql
-    assert 'target_chembl_id' in sql
-    assert 'AS "CHEMBL10"' in sql
-    assert 'AS "CHEMBL11"' in sql
-    assert "'CHEMBL10'" in sql
-    assert "'CHEMBL11'" in sql
+    assert 'CREATE OR REPLACE VIEW gold.vw_similarity_pivot_10_sources' in pivot_sql
+    assert 'target_chembl_id' in pivot_sql
+    assert 'AS "CHEMBL10"' in pivot_sql
+    assert 'AS "CHEMBL11"' in pivot_sql
+    assert "'CHEMBL10'" in pivot_sql
+    assert "'CHEMBL11'" in pivot_sql
 
 
 def test_build_pivot_view_sql_rejects_invalid_source_id() -> None:
     with pytest.raises(ValueError, match='Invalid source molecule IDs'):
         build_pivot_view_sql(['CHEMBL10', 'BAD_ID'])
-        

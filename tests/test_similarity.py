@@ -15,9 +15,10 @@ from lib.chembl.similarity import (
     calculate_similarity_chunk,
     fingerprint_from_binary,
     get_source_fingerprints_from_files,
-    normalize_chembl_id,
+    read_source_csv,
     update_top_candidates,
 )
+from lib.utils.parsing import normalize_chembl_id
 
 
 def make_fingerprint_binary(smiles: str) -> bytes:
@@ -28,6 +29,7 @@ def make_fingerprint_binary(smiles: str) -> bytes:
         fpSize=2048,
     )
     fingerprint = generator.GetFingerprint(molecule)
+
     return DataStructs.BitVectToBinaryText(fingerprint)
 
 
@@ -36,6 +38,36 @@ def test_normalize_chembl_id() -> None:
     assert normalize_chembl_id('') is None
     assert normalize_chembl_id(None) is None
     assert normalize_chembl_id(float('nan')) is None
+
+
+def test_read_source_csv_supports_utf8_sig(tmp_path) -> None:
+    csv_path = tmp_path / 'source_molecules_utf8_sig.csv'
+    csv_path.write_text(
+        'chembl_id\nCHEMBL1\nCHEMBL2\n',
+        encoding='utf-8-sig',
+    )
+
+    result = read_source_csv(
+        local_path=csv_path,
+        s3_key='test/source_molecules_utf8_sig.csv',
+    )
+
+    assert result['chembl_id'].tolist() == ['CHEMBL1', 'CHEMBL2']
+
+
+def test_read_source_csv_supports_utf16(tmp_path) -> None:
+    csv_path = tmp_path / 'source_molecules_utf16.csv'
+    csv_path.write_text(
+        'chembl_id\nCHEMBL1\nCHEMBL2\n',
+        encoding='utf-16',
+    )
+
+    result = read_source_csv(
+        local_path=csv_path,
+        s3_key='test/source_molecules_utf16.csv',
+    )
+
+    assert result['chembl_id'].tolist() == ['CHEMBL1', 'CHEMBL2']
 
 
 def test_update_top_candidates_keeps_best_rows_with_deterministic_tie_order() -> None:
@@ -214,4 +246,3 @@ def test_get_source_fingerprints_from_files_fallback_uses_limit(tmp_path) -> Non
     )
 
     assert result['chembl_id'].tolist() == ['CHEMBL1', 'CHEMBL2']
-    

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import http
+from http import HTTPStatus
 
 from lib.utils import teams
 
@@ -14,18 +14,37 @@ class FakeTaskInstance:
     task_id = 'test_task'
     run_id = 'manual_test'
     try_number = 1
-    log_url = 'http://localhost:8082'
+    log_url = (
+        'http://airflow-webserver:8080/dags/chembl_similarity_dag/'
+        'runs/manual_test/tasks/test_task?try_number=1'
+    )
 
 
 class FakeResponse:
     """Fake HTTP response."""
 
-    status_code = http.HTTPStatus.ACCEPTED
+    status_code = HTTPStatus.ACCEPTED
     text = 'accepted'
+
+
+def test_build_public_log_url_replaces_internal_airflow_host(monkeypatch) -> None:
+    monkeypatch.setenv('AIRFLOW_PUBLIC_BASE_URL', 'http://localhost:8082')
+
+    result = teams.build_public_log_url(
+        'http://airflow-webserver:8080/dags/chembl_similarity_dag/'
+        'runs/manual_test/tasks/test_task?try_number=1'
+    )
+
+    assert result == (
+        'http://localhost:8082/dags/chembl_similarity_dag/'
+        'runs/manual_test/tasks/test_task?try_number=1'
+    )
 
 
 def test_send_teams_alert_posts_message_payload(monkeypatch) -> None:
     posted_requests = []
+
+    monkeypatch.setenv('AIRFLOW_PUBLIC_BASE_URL', 'http://localhost:8082')
 
     monkeypatch.setattr(
         teams,
@@ -57,3 +76,11 @@ def test_send_teams_alert_posts_message_payload(monkeypatch) -> None:
     assert posted_requests[0]['url'] == 'https://example.test/webhook'
     assert posted_requests[0]['headers']['Content-Type'] == 'application/json'
     assert posted_requests[0]['json']['type'] == 'message'
+
+    payload_text = str(posted_requests[0]['json'])
+
+    assert 'Airflow Task Failed' in payload_text
+    assert 'chembl_similarity_dag' in payload_text
+    assert 'test_task' in payload_text
+    assert 'Test failure' in payload_text
+    assert 'http://localhost:8082/dags/chembl_similarity_dag' in payload_text

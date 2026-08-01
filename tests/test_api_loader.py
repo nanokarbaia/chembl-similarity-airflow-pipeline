@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import requests
 
@@ -17,9 +19,11 @@ class FakeResponse:
         self.text = str(self.payload)
 
     def json(self) -> dict:
+        """Return fake JSON payload."""
         return self.payload
 
     def raise_for_status(self) -> None:
+        """Raise HTTP error for failed response."""
         if self.status_code >= 400:
             raise requests.HTTPError(f'{self.status_code} error')
 
@@ -29,9 +33,10 @@ class FakeSession:
 
     def __init__(self, responses: list[FakeResponse]) -> None:
         self.responses = responses
-        self.calls = []
+        self.calls: list[dict[str, Any]] = []
 
-    def get(self, url: str, params: dict, timeout: int) -> FakeResponse:
+    def get(self, url: str, params: dict, timeout: Any) -> FakeResponse:
+        """Return next fake response."""
         self.calls.append(
             {
                 'url': url,
@@ -39,6 +44,7 @@ class FakeSession:
                 'timeout': timeout,
             }
         )
+
         return self.responses.pop(0)
 
 
@@ -88,10 +94,12 @@ def test_fetch_chembl_page_does_not_retry_non_retryable_status(monkeypatch) -> N
 
 def test_fetch_chembl_page_retries_timeout(monkeypatch) -> None:
     class TimeoutThenSuccessSession:
+        """Fake session that times out once, then succeeds."""
+
         def __init__(self) -> None:
             self.calls = 0
 
-        def get(self, url: str, params: dict, timeout: int) -> FakeResponse:
+        def get(self, url: str, params: dict, timeout: Any) -> FakeResponse:
             self.calls += 1
 
             if self.calls == 1:
@@ -191,4 +199,3 @@ def test_fetch_chembl_records_rejects_invalid_limits() -> None:
                 page_limit=0,
             )
         )
-        

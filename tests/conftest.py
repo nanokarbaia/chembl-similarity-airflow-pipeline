@@ -14,5 +14,6 @@ if str(DAGS_DIR) not in sys.path:
 
 os.environ.setdefault('S3_BUCKET', 'test-bucket')
 os.environ.setdefault('S3_BASE_PREFIX', 'final_task/test_user')
-os.environ.setdefault('SOURCE_INPUT_PREFIX', 'input/test_user')
+os.environ.setdefault('SOURCE_INPUT_PREFIX', 'final_task/test_user/input')
 os.environ.setdefault('AWS_DEFAULT_REGION', 'eu-central-1')
+os.environ.setdefault('AIRFLOW_PUBLIC_BASE_URL', 'http://localhost:8082')
