@@ -23,6 +23,8 @@ MAX_ATTEMPTS = 3
 REQUEST_TIMEOUT = (10, 90)
 MAX_EXCEPTION_LENGTH = 1500
 
+GIF_URL = 'https://media.giphy.com/media/l1EsZj5uwpdEJJSJq/giphy.gif'
+
 
 def truncate_text(value: str, max_length: int = MAX_EXCEPTION_LENGTH) -> str:
     """Truncate long text for Teams message safety."""
@@ -115,32 +117,80 @@ def build_adaptive_card_payload(
                 'contentType': 'application/vnd.microsoft.card.adaptive',
                 'contentUrl': None,
                 'content': {
-                    '$schema': 'http://adaptivecards.io/schemas/adaptive-card.json',
+                    '$schema': (
+                        'http://adaptivecards.io/schemas/'
+                        'adaptive-card.json'
+                    ),
                     'type': 'AdaptiveCard',
                     'version': '1.2',
                     'body': [
                         {
                             'type': 'TextBlock',
-                            'text': '🚨 Airflow Task Failed',
+                            'text': (
+                                '🧪 Molecule by molecule... '
+                                'something broke!'
+                            ),
                             'weight': 'Bolder',
                             'size': 'Large',
                             'color': 'Attention',
+                            'wrap': True,
+                        },
+                        {
+                            'type': 'TextBlock',
+                            'text': 'Failure alert by Nano Karbaia',
+                            'weight': 'Bolder',
+                            'spacing': 'Small',
+                            'wrap': True,
+                        },
+                        {
+                            'type': 'Image',
+                            'url': GIF_URL,
+                            'size': 'Stretch',
+                            'horizontalAlignment': 'Center',
+                            'altText': 'Molecule by molecule failure alert',
+                        },
+                        {
+                            'type': 'TextBlock',
+                            'text': (
+                                'The pipeline was processing molecule by '
+                                'molecule, and then one molecule chose '
+                                'violence. Please check the logs before '
+                                'Plankton starts debugging production.'
+                            ),
+                            'wrap': True,
                         },
                         {
                             'type': 'FactSet',
                             'facts': [
                                 {'title': 'DAG', 'value': dag_id},
-                                {'title': 'Task', 'value': task_id},
+                                {
+                                    'title': 'Broken reaction step',
+                                    'value': task_id,
+                                },
                                 {'title': 'Run ID', 'value': run_id},
-                                {'title': 'Try number', 'value': str(try_number)},
-                                {'title': 'Exception', 'value': exception_text},
+                                {
+                                    'title': 'Try number',
+                                    'value': str(try_number),
+                                },
+                                {
+                                    'title': 'Exception',
+                                    'value': exception_text,
+                                },
                             ],
                         },
                         {
                             'type': 'TextBlock',
-                            'text': f'[Open Airflow logs]({log_url})',
+                            'text': 'Status: Needs human catalyst ⚗️',
+                            'weight': 'Bolder',
                             'wrap': True,
                         },
+                    ],
+                    'actions': [
+                        {
+                            'type': 'Action.OpenUrl',
+                            'title': 'Open Airflow logs',
+                            'url': log_url,
+                        }
                     ],
                 },
             }

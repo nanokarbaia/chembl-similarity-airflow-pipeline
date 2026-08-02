@@ -41,6 +41,34 @@ def test_build_public_log_url_replaces_internal_airflow_host(monkeypatch) -> Non
     )
 
 
+def test_build_adaptive_card_payload_contains_fun_alert_details() -> None:
+    payload = teams.build_adaptive_card_payload(
+        dag_id='chembl_similarity_dag',
+        task_id='compute_fingerprints',
+        run_id='manual_test',
+        try_number=1,
+        log_url='http://localhost:8082/logs',
+        exception=Exception('Test failure'),
+    )
+
+    assert payload['type'] == 'message'
+
+    payload_text = str(payload)
+
+    assert 'Molecule by molecule... something broke!' in payload_text
+    assert 'Failure alert by Nano Karbaia' in payload_text
+    assert 'one molecule chose violence' in payload_text
+    assert 'Plankton starts debugging production' in payload_text
+    assert 'Needs human catalyst' in payload_text
+    assert teams.GIF_URL in payload_text
+
+    assert 'chembl_similarity_dag' in payload_text
+    assert 'compute_fingerprints' in payload_text
+    assert 'manual_test' in payload_text
+    assert 'Test failure' in payload_text
+    assert 'http://localhost:8082/logs' in payload_text
+
+
 def test_send_teams_alert_posts_message_payload(monkeypatch) -> None:
     posted_requests = []
 
@@ -79,7 +107,8 @@ def test_send_teams_alert_posts_message_payload(monkeypatch) -> None:
 
     payload_text = str(posted_requests[0]['json'])
 
-    assert 'Airflow Task Failed' in payload_text
+    assert 'Molecule by molecule... something broke!' in payload_text
+    assert 'Failure alert by Nano Karbaia' in payload_text
     assert 'chembl_similarity_dag' in payload_text
     assert 'test_task' in payload_text
     assert 'Test failure' in payload_text
