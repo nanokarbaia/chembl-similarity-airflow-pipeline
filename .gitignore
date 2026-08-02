@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.env
+.envrc
+.venv/
+venv/
+env/
+
+# Airflow runtime files
+logs/
+config/*
+!config/.gitkeep
+
+# Plugins placeholder
+plugins/*
+!plugins/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large downloaded ChEMBL files
+chembl_cache/
